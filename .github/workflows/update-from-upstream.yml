@@ -1,0 +1,31 @@
+name: Upstream Sync
+
+permissions:
+  contents: write
+
+on:
+  schedule:
+    - cron: "0 3 * * THU"
+  workflow_dispatch:
+
+# env:
+#   UPSTREAM_REPO: dani-garcia/vaultwarden
+
+jobs:
+  sync_with_upstream:
+    name: Sync with Upstream
+    runs-on: ubuntu-latest
+    # if: ${{ github.event.repository.fork }}
+    steps:
+      - name: Checkout target repo
+        uses: actions/checkout@master
+
+      - name: Sync Upstream
+        uses: tgymnich/fork-sync@master
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          #   # upstream_sync_repo: ${{ env.UPSTREAM_REPO }}
+          ignore_fail: true
+          owner: dani-garcia
+          base: main
+          head: main
