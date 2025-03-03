@@ -194,16 +194,16 @@ pub struct InviteJwtClaims {
     pub sub: UserId,
 
     pub email: String,
-    pub org_id: Option<OrganizationId>,
-    pub member_id: Option<MembershipId>,
+    pub org_id: OrganizationId,
+    pub member_id: MembershipId,
     pub invited_by_email: Option<String>,
 }
 
 pub fn generate_invite_claims(
     user_id: UserId,
     email: String,
-    org_id: Option<OrganizationId>,
-    member_id: Option<MembershipId>,
+    org_id: OrganizationId,
+    member_id: MembershipId,
     invited_by_email: Option<String>,
 ) -> InviteJwtClaims {
     let time_now = Utc::now();
@@ -542,8 +542,27 @@ pub struct OrgHeaders {
     pub device: Device,
     pub user: User,
     pub membership_type: MembershipType,
+    pub membership_status: MembershipStatus,
     pub membership: Membership,
     pub ip: ClientIp,
+}
+
+impl OrgHeaders {
+    fn is_member(&self) -> bool {
+        // NOTE: we don't care about MembershipStatus at the moment because this is only used
+        // where an invited, accepted or confirmed user is expected if this ever changes or
+        // if from_i32 is changed to return Some(Revoked) this check needs to be changed accordingly
+        self.membership_type >= MembershipType::User
+    }
+    fn is_confirmed_and_admin(&self) -> bool {
+        self.membership_status == MembershipStatus::Confirmed && self.membership_type >= MembershipType::Admin
+    }
+    fn is_confirmed_and_manager(&self) -> bool {
+        self.membership_status == MembershipStatus::Confirmed && self.membership_type >= MembershipType::Manager
+    }
+    fn is_confirmed_and_owner(&self) -> bool {
+        self.membership_status == MembershipStatus::Confirmed && self.membership_type == MembershipType::Owner
+    }
 }
 
 #[rocket::async_trait]
@@ -557,39 +576,25 @@ impl<'r> FromRequest<'r> for OrgHeaders {
         // but there are cases where it is a query value.
         // First check the path, if this is not a valid uuid, try the query values.
         let url_org_id: Option<OrganizationId> = {
-            let mut url_org_id = None;
-            if let Some(Ok(org_id)) = request.param::<&str>(1) {
-                if uuid::Uuid::parse_str(org_id).is_ok() {
-                    url_org_id = Some(org_id.to_string().into());
-                }
+            if let Some(Ok(org_id)) = request.param::<OrganizationId>(1) {
+                Some(org_id.clone())
+            } else if let Some(Ok(org_id)) = request.query_value::<OrganizationId>("organizationId") {
+                Some(org_id.clone())
+            } else {
+                None
             }
-
-            if let Some(Ok(org_id)) = request.query_value::<&str>("organizationId") {
-                if uuid::Uuid::parse_str(org_id).is_ok() {
-                    url_org_id = Some(org_id.to_string().into());
-                }
-            }
-
-            url_org_id
         };
 
         match url_org_id {
-            Some(org_id) => {
+            Some(org_id) if uuid::Uuid::parse_str(&org_id).is_ok() => {
                 let mut conn = match DbConn::from_request(request).await {
                     Outcome::Success(conn) => conn,
                     _ => err_handler!("Error getting DB"),
                 };
 
                 let user = headers.user;
-                let membership = match Membership::find_by_user_and_org(&user.uuid, &org_id, &mut conn).await {
-                    Some(member) => {
-                        if member.status == MembershipStatus::Confirmed as i32 {
-                            member
-                        } else {
-                            err_handler!("The current user isn't confirmed member of the organization")
-                        }
-                    }
-                    None => err_handler!("The current user isn't member of the organization"),
+                let Some(membership) = Membership::find_by_user_and_org(&user.uuid, &org_id, &mut conn).await else {
+                    err_handler!("The current user isn't member of the organization");
                 };
 
                 Outcome::Success(Self {
@@ -597,11 +602,20 @@ impl<'r> FromRequest<'r> for OrgHeaders {
                     device: headers.device,
                     user,
                     membership_type: {
-                        if let Some(org_usr_type) = MembershipType::from_i32(membership.atype) {
-                            org_usr_type
+                        if let Some(member_type) = MembershipType::from_i32(membership.atype) {
+                            member_type
                         } else {
                             // This should only happen if the DB is corrupted
                             err_handler!("Unknown user type in the database")
+                        }
+                    },
+                    membership_status: {
+                        if let Some(member_status) = MembershipStatus::from_i32(membership.status) {
+                            // NOTE: add additional check for revoked if from_i32 is ever changed
+                            // to return Revoked status.
+                            member_status
+                        } else {
+                            err_handler!("User status is either revoked or invalid.")
                         }
                     },
                     membership,
@@ -619,6 +633,7 @@ pub struct AdminHeaders {
     pub user: User,
     pub membership_type: MembershipType,
     pub ip: ClientIp,
+    pub org_id: OrganizationId,
 }
 
 #[rocket::async_trait]
@@ -627,13 +642,14 @@ impl<'r> FromRequest<'r> for AdminHeaders {
 
     async fn from_request(request: &'r Request<'_>) -> Outcome<Self, Self::Error> {
         let headers = try_outcome!(OrgHeaders::from_request(request).await);
-        if headers.membership_type >= MembershipType::Admin {
+        if headers.is_confirmed_and_admin() {
             Outcome::Success(Self {
                 host: headers.host,
                 device: headers.device,
                 user: headers.user,
                 membership_type: headers.membership_type,
                 ip: headers.ip,
+                org_id: headers.membership.org_uuid,
             })
         } else {
             err_handler!("You need to be Admin or Owner to call this endpoint")
@@ -679,6 +695,7 @@ pub struct ManagerHeaders {
     pub device: Device,
     pub user: User,
     pub ip: ClientIp,
+    pub org_id: OrganizationId,
 }
 
 #[rocket::async_trait]
@@ -687,7 +704,7 @@ impl<'r> FromRequest<'r> for ManagerHeaders {
 
     async fn from_request(request: &'r Request<'_>) -> Outcome<Self, Self::Error> {
         let headers = try_outcome!(OrgHeaders::from_request(request).await);
-        if headers.membership_type >= MembershipType::Manager {
+        if headers.is_confirmed_and_manager() {
             match get_col_id(request) {
                 Some(col_id) => {
                     let mut conn = match DbConn::from_request(request).await {
@@ -707,6 +724,7 @@ impl<'r> FromRequest<'r> for ManagerHeaders {
                 device: headers.device,
                 user: headers.user,
                 ip: headers.ip,
+                org_id: headers.membership.org_uuid,
             })
         } else {
             err_handler!("You need to be a Manager, Admin or Owner to call this endpoint")
@@ -741,7 +759,7 @@ impl<'r> FromRequest<'r> for ManagerHeadersLoose {
 
     async fn from_request(request: &'r Request<'_>) -> Outcome<Self, Self::Error> {
         let headers = try_outcome!(OrgHeaders::from_request(request).await);
-        if headers.membership_type >= MembershipType::Manager {
+        if headers.is_confirmed_and_manager() {
             Outcome::Success(Self {
                 host: headers.host,
                 device: headers.device,
@@ -786,6 +804,7 @@ impl ManagerHeaders {
             device: h.device,
             user: h.user,
             ip: h.ip,
+            org_id: h.membership.org_uuid,
         })
     }
 }
@@ -794,6 +813,7 @@ pub struct OwnerHeaders {
     pub device: Device,
     pub user: User,
     pub ip: ClientIp,
+    pub org_id: OrganizationId,
 }
 
 #[rocket::async_trait]
@@ -802,14 +822,39 @@ impl<'r> FromRequest<'r> for OwnerHeaders {
 
     async fn from_request(request: &'r Request<'_>) -> Outcome<Self, Self::Error> {
         let headers = try_outcome!(OrgHeaders::from_request(request).await);
-        if headers.membership_type == MembershipType::Owner {
+        if headers.is_confirmed_and_owner() {
             Outcome::Success(Self {
                 device: headers.device,
                 user: headers.user,
                 ip: headers.ip,
+                org_id: headers.membership.org_uuid,
             })
         } else {
             err_handler!("You need to be Owner to call this endpoint")
+        }
+    }
+}
+
+pub struct OrgMemberHeaders {
+    pub host: String,
+    pub user: User,
+    pub org_id: OrganizationId,
+}
+
+#[rocket::async_trait]
+impl<'r> FromRequest<'r> for OrgMemberHeaders {
+    type Error = &'static str;
+
+    async fn from_request(request: &'r Request<'_>) -> Outcome<Self, Self::Error> {
+        let headers = try_outcome!(OrgHeaders::from_request(request).await);
+        if headers.is_member() {
+            Outcome::Success(Self {
+                host: headers.host,
+                user: headers.user,
+                org_id: headers.membership.org_uuid,
+            })
+        } else {
+            err_handler!("You need to be a Member of the Organization to call this endpoint")
         }
     }
 }

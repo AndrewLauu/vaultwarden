@@ -17,6 +17,7 @@ use macros::UuidFromParam;
 db_object! {
     #[derive(Identifiable, Queryable, Insertable, AsChangeset)]
     #[diesel(table_name = organizations)]
+    #[diesel(treat_none_as_null = true)]
     #[diesel(primary_key(uuid))]
     pub struct Organization {
         pub uuid: OrganizationId,
@@ -28,6 +29,7 @@ db_object! {
 
     #[derive(Identifiable, Queryable, Insertable, AsChangeset)]
     #[diesel(table_name = users_organizations)]
+    #[diesel(treat_none_as_null = true)]
     #[diesel(primary_key(uuid))]
     pub struct Membership {
         pub uuid: MembershipId,
@@ -55,11 +57,25 @@ db_object! {
 }
 
 // https://github.com/bitwarden/server/blob/b86a04cef9f1e1b82cf18e49fc94e017c641130c/src/Core/Enums/OrganizationUserStatusType.cs
+#[derive(PartialEq)]
 pub enum MembershipStatus {
     Revoked = -1,
     Invited = 0,
     Accepted = 1,
     Confirmed = 2,
+}
+
+impl MembershipStatus {
+    pub fn from_i32(status: i32) -> Option<Self> {
+        match status {
+            0 => Some(Self::Invited),
+            1 => Some(Self::Accepted),
+            2 => Some(Self::Confirmed),
+            // NOTE: we don't care about revoked members where this is used
+            // if this ever changes also adapt the OrgHeaders check.
+            _ => None,
+        }
+    }
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, num_derive::FromPrimitive)]
@@ -152,6 +168,7 @@ impl PartialOrd<MembershipType> for i32 {
 /// Local methods
 impl Organization {
     pub fn new(name: String, billing_email: String, private_key: Option<String>, public_key: Option<String>) -> Self {
+        let billing_email = billing_email.to_lowercase();
         Self {
             uuid: OrganizationId(crate::util::get_uuid()),
             name,
@@ -307,8 +324,8 @@ use crate::error::MapResult;
 /// Database methods
 impl Organization {
     pub async fn save(&self, conn: &mut DbConn) -> EmptyResult {
-        if !email_address::EmailAddress::is_valid(self.billing_email.trim()) {
-            err!(format!("BillingEmail {} is not a valid email address", self.billing_email.trim()))
+        if !crate::util::is_valid_email(&self.billing_email) {
+            err!(format!("BillingEmail {} is not a valid email address", self.billing_email))
         }
 
         for member in Membership::find_by_org(&self.uuid, conn).await.iter() {
@@ -449,7 +466,7 @@ impl Membership {
             "familySponsorshipValidUntil": null,
             "familySponsorshipToDelete": null,
             "accessSecretsManager": false,
-            "limitCollectionCreation": true,
+            "limitCollectionCreation": self.atype < MembershipType::Manager, // If less then a manager return true, to limit collection creations
             "limitCollectionCreationDeletion": true,
             "limitCollectionDeletion": true,
             "allowAdminAccessToAllCollectionItems": true,
@@ -502,7 +519,7 @@ impl Membership {
             CONFIG.org_groups_enabled() && Group::is_in_full_access_group(&self.user_uuid, &self.org_uuid, conn).await;
 
         // If collections are to be included, only include them if the user does not have full access via a group or defined to the user it self
-        let collections: Vec<Value> = if include_collections && !(full_access_group || self.has_full_access()) {
+        let collections: Vec<Value> = if include_collections && !(full_access_group || self.access_all) {
             // Get all collections for the user here already to prevent more queries
             let cu: HashMap<CollectionId, CollectionUser> =
                 CollectionUser::find_by_organization_and_user_uuid(&self.org_uuid, &self.user_uuid, conn)
@@ -522,13 +539,13 @@ impl Membership {
                 .await
                 .into_iter()
                 .filter_map(|c| {
-                    let (read_only, hide_passwords, can_manage) = if self.has_full_access() {
+                    let (read_only, hide_passwords, manage) = if self.has_full_access() {
                         (false, false, self.atype >= MembershipType::Manager)
                     } else if let Some(cu) = cu.get(&c.uuid) {
                         (
                             cu.read_only,
                             cu.hide_passwords,
-                            self.atype == MembershipType::Manager && !cu.read_only && !cu.hide_passwords,
+                            cu.manage || (self.atype == MembershipType::Manager && !cu.read_only && !cu.hide_passwords),
                         )
                     // If previous checks failed it might be that this user has access via a group, but we should not return those elements here
                     // Those are returned via a special group endpoint
@@ -542,7 +559,7 @@ impl Membership {
                         "id": c.uuid,
                         "readOnly": read_only,
                         "hidePasswords": hide_passwords,
-                        "manage": can_manage,
+                        "manage": manage,
                     }))
                 })
                 .collect()
@@ -611,6 +628,7 @@ impl Membership {
             "id": self.uuid,
             "readOnly": col_user.read_only,
             "hidePasswords": col_user.hide_passwords,
+            "manage": col_user.manage,
         })
     }
 
@@ -622,11 +640,12 @@ impl Membership {
                 CollectionUser::find_by_organization_and_user_uuid(&self.org_uuid, &self.user_uuid, conn).await;
             collections
                 .iter()
-                .map(|c| {
+                .map(|cu| {
                     json!({
-                        "id": c.collection_uuid,
-                        "readOnly": c.read_only,
-                        "hidePasswords": c.hide_passwords,
+                        "id": cu.collection_uuid,
+                        "readOnly": cu.read_only,
+                        "hidePasswords": cu.hide_passwords,
+                        "manage": cu.manage,
                     })
                 })
                 .collect()

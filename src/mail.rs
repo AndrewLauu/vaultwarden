@@ -1,7 +1,6 @@
-use std::str::FromStr;
-
 use chrono::NaiveDateTime;
 use percent_encoding::{percent_encode, NON_ALPHANUMERIC};
+use std::{env::consts::EXE_SUFFIX, str::FromStr};
 
 use lettre::{
     message::{Attachment, Body, Mailbox, Message, MultiPart, SinglePart},
@@ -26,7 +25,7 @@ fn sendmail_transport() -> AsyncSendmailTransport<Tokio1Executor> {
     if let Some(command) = CONFIG.sendmail_command() {
         AsyncSendmailTransport::new_with_command(command)
     } else {
-        AsyncSendmailTransport::new()
+        AsyncSendmailTransport::new_with_command(format!("sendmail{EXE_SUFFIX}"))
     }
 }
 
@@ -259,8 +258,8 @@ pub async fn send_single_org_removed_from_org(address: &str, org_name: &str) -> 
 
 pub async fn send_invite(
     user: &User,
-    org_id: Option<OrganizationId>,
-    member_id: Option<MembershipId>,
+    org_id: OrganizationId,
+    member_id: MembershipId,
     org_name: &str,
     invited_by_email: Option<String>,
 ) -> EmptyResult {
@@ -272,22 +271,14 @@ pub async fn send_invite(
         invited_by_email,
     );
     let invite_token = encode_jwt(&claims);
-    let org_id = match org_id {
-        Some(ref org_id) => org_id.as_ref(),
-        None => "_",
-    };
-    let member_id = match member_id {
-        Some(ref member_id) => member_id.as_ref(),
-        None => "_",
-    };
     let mut query = url::Url::parse("https://query.builder").unwrap();
     {
         let mut query_params = query.query_pairs_mut();
         query_params
             .append_pair("email", &user.email)
             .append_pair("organizationName", org_name)
-            .append_pair("organizationId", org_id)
-            .append_pair("organizationUserId", member_id)
+            .append_pair("organizationId", &org_id)
+            .append_pair("organizationUserId", &member_id)
             .append_pair("token", &invite_token);
         if user.private_key.is_some() {
             query_params.append_pair("orgUserHasExistingUser", "true");
@@ -603,13 +594,13 @@ async fn send_with_selected_transport(email: Message) -> EmptyResult {
             // Match some common errors and make them more user friendly
             Err(e) => {
                 if e.is_client() {
-                    debug!("Sendmail client error: {:#?}", e);
+                    debug!("Sendmail client error: {:?}", e);
                     err!(format!("Sendmail client error: {e}"));
                 } else if e.is_response() {
-                    debug!("Sendmail response error: {:#?}", e);
+                    debug!("Sendmail response error: {:?}", e);
                     err!(format!("Sendmail response error: {e}"));
                 } else {
-                    debug!("Sendmail error: {:#?}", e);
+                    debug!("Sendmail error: {:?}", e);
                     err!(format!("Sendmail error: {e}"));
                 }
             }

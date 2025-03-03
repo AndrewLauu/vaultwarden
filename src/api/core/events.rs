@@ -34,9 +34,13 @@ struct EventRange {
 async fn get_org_events(
     org_id: OrganizationId,
     data: EventRange,
-    _headers: AdminHeaders,
+    headers: AdminHeaders,
     mut conn: DbConn,
 ) -> JsonResult {
+    if org_id != headers.org_id {
+        err!("Organization not found", "Organization id's do not match");
+    }
+
     // Return an empty vec when we org events are disabled.
     // This prevents client errors
     let events_json: Vec<Value> = if !CONFIG.org_events_enabled() {
@@ -100,9 +104,12 @@ async fn get_user_events(
     org_id: OrganizationId,
     member_id: MembershipId,
     data: EventRange,
-    _headers: AdminHeaders,
+    headers: AdminHeaders,
     mut conn: DbConn,
 ) -> JsonResult {
+    if org_id != headers.org_id {
+        err!("Organization not found", "Organization id's do not match");
+    }
     // Return an empty vec when we org events are disabled.
     // This prevents client errors
     let events_json: Vec<Value> = if !CONFIG.org_events_enabled() {
@@ -238,8 +245,8 @@ async fn _log_user_event(
     ip: &IpAddr,
     conn: &mut DbConn,
 ) {
-    let orgs = Membership::get_orgs_by_user(user_id, conn).await;
-    let mut events: Vec<Event> = Vec::with_capacity(orgs.len() + 1); // We need an event per org and one without an org
+    let memberships = Membership::find_by_user(user_id, conn).await;
+    let mut events: Vec<Event> = Vec::with_capacity(memberships.len() + 1); // We need an event per org and one without an org
 
     // Upstream saves the event also without any org_id.
     let mut event = Event::new(event_type, event_date);
@@ -250,10 +257,11 @@ async fn _log_user_event(
     events.push(event);
 
     // For each org a user is a member of store these events per org
-    for org_id in orgs {
+    for membership in memberships {
         let mut event = Event::new(event_type, event_date);
         event.user_uuid = Some(user_id.clone());
-        event.org_uuid = Some(org_id);
+        event.org_uuid = Some(membership.org_uuid);
+        event.org_user_uuid = Some(membership.uuid);
         event.act_user_uuid = Some(user_id.clone());
         event.device_type = Some(device_type);
         event.ip_address = Some(ip.to_string());

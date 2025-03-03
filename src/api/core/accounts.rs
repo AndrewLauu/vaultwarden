@@ -30,6 +30,7 @@ pub fn routes() -> Vec<rocket::Route> {
         profile,
         put_profile,
         post_profile,
+        put_avatar,
         get_public_keys,
         post_keys,
         post_password,
@@ -42,9 +43,8 @@ pub fn routes() -> Vec<rocket::Route> {
         post_verify_email_token,
         post_delete_recover,
         post_delete_recover_token,
-        post_device_token,
-        delete_account,
         post_delete_account,
+        delete_account,
         revision_date,
         password_hint,
         prelogin,
@@ -52,7 +52,9 @@ pub fn routes() -> Vec<rocket::Route> {
         api_key,
         rotate_api_key,
         get_known_device,
-        put_avatar,
+        get_all_devices,
+        get_device,
+        post_device_token,
         put_device_token,
         put_clear_device_token,
         post_clear_device_token,
@@ -923,9 +925,9 @@ async fn password_hint(data: Json<PasswordHintData>, mut conn: DbConn) -> EmptyR
                 // paths that send mail take noticeably longer than ones that
                 // don't. Add a randomized sleep to mitigate this somewhat.
                 use rand::{rngs::SmallRng, Rng, SeedableRng};
-                let mut rng = SmallRng::from_entropy();
+                let mut rng = SmallRng::from_os_rng();
                 let delta: i32 = 100;
-                let sleep_ms = (1_000 + rng.gen_range(-delta..=delta)) as u64;
+                let sleep_ms = (1_000 + rng.random_range(-delta..=delta)) as u64;
                 tokio::time::sleep(tokio::time::Duration::from_millis(sleep_ms)).await;
                 Ok(())
             } else {
@@ -1068,6 +1070,26 @@ impl<'r> FromRequest<'r> for KnownDevice {
     }
 }
 
+#[get("/devices")]
+async fn get_all_devices(headers: Headers, mut conn: DbConn) -> JsonResult {
+    let devices = Device::find_with_auth_request_by_user(&headers.user.uuid, &mut conn).await;
+    let devices = devices.iter().map(|device| device.to_json()).collect::<Vec<Value>>();
+
+    Ok(Json(json!({
+        "data": devices,
+        "continuationToken": null,
+        "object": "list"
+    })))
+}
+
+#[get("/devices/identifier/<device_id>")]
+async fn get_device(device_id: DeviceId, headers: Headers, mut conn: DbConn) -> JsonResult {
+    let Some(device) = Device::find_by_uuid_and_user(&device_id, &headers.user.uuid, &mut conn).await else {
+        err!("No device found");
+    };
+    Ok(Json(device.to_json()))
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct PushToken {
@@ -1184,6 +1206,15 @@ async fn post_auth_request(
 
     nt.send_auth_request(&user.uuid, &auth_request.uuid, &data.device_identifier, &mut conn).await;
 
+    log_user_event(
+        EventType::UserRequestedDeviceApproval as i32,
+        &user.uuid,
+        client_headers.device_type,
+        &client_headers.ip.ip,
+        &mut conn,
+    )
+    .await;
+
     Ok(Json(json!({
         "id": auth_request.uuid,
         "publicKey": auth_request.public_key,
@@ -1265,9 +1296,26 @@ async fn put_auth_request(
 
         ant.send_auth_response(&auth_request.user_uuid, &auth_request.uuid).await;
         nt.send_auth_response(&auth_request.user_uuid, &auth_request.uuid, &data.device_identifier, &mut conn).await;
+
+        log_user_event(
+            EventType::OrganizationUserApprovedAuthRequest as i32,
+            &headers.user.uuid,
+            headers.device.atype,
+            &headers.ip.ip,
+            &mut conn,
+        )
+        .await;
     } else {
         // If denied, there's no reason to keep the request
         auth_request.delete(&mut conn).await?;
+        log_user_event(
+            EventType::OrganizationUserRejectedAuthRequest as i32,
+            &headers.user.uuid,
+            headers.device.atype,
+            &headers.ip.ip,
+            &mut conn,
+        )
+        .await;
     }
 
     Ok(Json(json!({

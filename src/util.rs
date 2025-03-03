@@ -55,8 +55,17 @@ impl Fairing for AppHeaders {
         res.set_raw_header("Referrer-Policy", "same-origin");
         res.set_raw_header("X-Content-Type-Options", "nosniff");
         res.set_raw_header("X-Robots-Tag", "noindex, nofollow");
+
         // Obsolete in modern browsers, unsafe (XS-Leak), and largely replaced by CSP
         res.set_raw_header("X-XSS-Protection", "0");
+
+        // The `Cross-Origin-Resource-Policy` header should not be set on images or on the `icon_external` route.
+        // Otherwise some clients, like the Bitwarden Desktop, will fail to download the icons
+        if !(res.headers().get_one("Content-Type").is_some_and(|v| v.starts_with("image/"))
+            || req.route().is_some_and(|v| v.name.as_deref() == Some("icon_external")))
+        {
+            res.set_raw_header("Cross-Origin-Resource-Policy", "same-origin");
+        }
 
         // Do not send the Content-Security-Policy (CSP) Header and X-Frame-Options for the *-connector.html files.
         // This can cause issues when some MFA requests needs to open a popup or page within the clients like WebAuthn, or Duo.
@@ -74,7 +83,9 @@ impl Fairing for AppHeaders {
             // # Mail Relay: https://bitwarden.com/blog/add-privacy-and-security-using-email-aliases-with-bitwarden/
             // app.simplelogin.io, app.addy.io, api.fastmail.com, quack.duckduckgo.com
             let csp = format!(
-                "default-src 'self'; \
+                "default-src 'none'; \
+                font-src 'self'; \
+                manifest-src 'self'; \
                 base-uri 'self'; \
                 form-action 'self'; \
                 object-src 'self' blob:; \
@@ -459,6 +470,23 @@ pub fn format_datetime_http(dt: &DateTime<Local>) -> String {
 
 pub fn parse_date(date: &str) -> NaiveDateTime {
     DateTime::parse_from_rfc3339(date).unwrap().naive_utc()
+}
+
+/// Returns true or false if an email address is valid or not
+///
+/// Some extra checks instead of only using email_address
+/// This prevents from weird email formats still excepted but in the end invalid
+pub fn is_valid_email(email: &str) -> bool {
+    let Ok(email) = email_address::EmailAddress::from_str(email) else {
+        return false;
+    };
+    let Ok(email_url) = url::Url::parse(&format!("https://{}", email.domain())) else {
+        return false;
+    };
+    if email_url.path().ne("/") || email_url.domain().is_none() || email_url.query().is_some() {
+        return false;
+    }
+    true
 }
 
 //
