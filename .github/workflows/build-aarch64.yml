@@ -1,0 +1,106 @@
+name: Build Termux Release
+permissions:
+  contents: write
+
+on:
+  push:
+    tags:
+      # https://docs.github.com/en/actions/writing-workflows/workflow-syntax-for-github-actions#filter-pattern-cheat-sheet
+      - "[1-2].[0-9]+.[0-9]+"
+  workflow_dispatch:
+
+# 并发控制：避免同一个标签重复运行构建任务
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-release:
+    name: Build & Release aarch64 Binary
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      ARCHIVE_NAME: ""
+
+    steps:
+      # Checkout the repo
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      # End Checkout the repo
+
+      # Install dependencies
+      # - name: "Install dependencies Ubuntu"
+      #   run: sudo apt-get update && sudo apt-get install -y --no-install-recommends openssl build-essential libssl-dev pkg-config libsqlite3-dev # libmariadb-dev-compat libpq-dev
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      - name: Install Cross cross-compile tool
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+      # End Install dependencies
+
+      - name: Create Cross.toml for OpenSSL static build
+        run: |
+          cat > Cross.toml << 'EOF'
+          [target.aarch64-linux-android]
+          pre-build = [
+            "apt-get update && apt-get install -y --no-install-recommends perl make gcc"
+          ]
+          [target.aarch64-linux-android.env]
+          OPENSSL_STATIC = "1"
+          OPENSSL_NO_VENDOR = "0"
+          PKG_CONFIG_ALLOW_CROSS = "1"
+          CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER = "aarch64-linux-android24-clang"
+          CC_aarch64_linux_android = "aarch64-linux-android24-clang"
+          CXX_aarch64_linux_android = "aarch64-linux-android24-clang++"
+          AR_aarch64_linux_android = "llvm-ar"
+          RANLIB_aarch64_linux_android = "llvm-ranlib"
+          RUSTFLAGS = "-C link-arg=-s -C link-arg=-Wl,--no-as-needed"
+          linker = "aarch64-linux-android24-clang"
+          EOF
+        
+      - name: Build aarch64 release binary
+        run: |
+          RUSTFLAGS='-C link-arg=-s -C link-arg=-Wl,--no-as-needed -C linker=aarch64-linux-android24-clang' \
+          cross build \
+            --target aarch64-linux-android \
+            --features "sqlite,openssl/vendored" \
+            --release
+
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')  # 仅标签推送时发布
+        uses: softprops/action-gh-release@v2
+
+      - name: Pack binary to tar.gz archive
+        run: |
+          PROJECT_NAME="vaultwarden"
+          
+          TAG_NAME=${{ github.ref_name }}
+          if [[ "${TAG_NAME}" == 'main' ]]; then
+            TAG_NAME=$(date +%s)
+          fi
+
+          ARCHIVE_NAME="${PROJECT_NAME}-${TAG_NAME}-aarch64-linux-android.tar.gz"
+
+          tar -czvf ${ARCHIVE_NAME} \
+              -C target/aarch64-linux-android/release/ \
+              ${PROJECT_NAME}
+
+          # 把文件名传递给后续步骤，方便上传
+          echo "ARCHIVE_NAME=${ARCHIVE_NAME}" >> $GITHUB_ENV
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ env.ARCHIVE_NAME }}
+          generate_release_notes: true
+          name: ${{ env.ARCHIVE_NAME }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
